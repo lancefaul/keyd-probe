@@ -1,0 +1,13 @@
+pkgbase = keyd-probe
+	pkgdesc = Identify what an input device actually sends, and scaffold a keyd config
+	pkgver = 0.1.1
+	pkgrel = 1
+	url = https://github.com/lancefaul/keyd-probe
+	arch = any
+	license = MIT
+	depends = python
+	optdepends = keyd: verifies key names against `keyd list-keys` and detects managed devices
+	source = keyd-probe-0.1.1.tar.gz::https://github.com/lancefaul/keyd-probe/archive/refs/tags/v0.1.1.tar.gz
+	sha256sums = d3754118d0dda13d72a55f92e89e86c97b82d633c7dfa67f522c347d541cc601
+
+pkgname = keyd-probe

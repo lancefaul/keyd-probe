@@ -1,0 +1,26 @@
+# Maintainer: Lance Faul <lancefaul@proton.me>
+
+pkgname=keyd-probe
+pkgver=0.1.1
+pkgrel=1
+pkgdesc="Identify what an input device actually sends, and scaffold a keyd config"
+arch=('any')
+url="https://github.com/lancefaul/keyd-probe"
+license=('MIT')
+depends=('python')
+optdepends=('keyd: verifies key names against `keyd list-keys` and detects managed devices')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('d3754118d0dda13d72a55f92e89e86c97b82d633c7dfa67f522c347d541cc601')
+
+check() {
+    cd "$pkgname-$pkgver"
+    python3 tests/test_report.py
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 keyd-probe "$pkgdir/usr/bin/keyd-probe"
+    install -Dm644 keyd-probe.1 "$pkgdir/usr/share/man/man1/keyd-probe.1"
+    install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+    install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
