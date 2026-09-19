@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""keyd-probe - find out what an input device actually sends, then scaffold a keyd config.
+
+keyd remaps keys by name, which means the first problem every keyd user has is
+not "what do I want this key to do" but "what does this key even send?".  A lot
+of devices lie about it: a four-key macropad ships as numpad 1-4, a volume knob
+ships as consumer-control volume keys, and a single physical device can expose
+three or four separate kernel interfaces that have to be handled together.
+
+    keyd-probe list             # what input devices exist, grouped by USB id
+    keyd-probe watch <device>   # press things; see exactly what they emit
+    keyd-probe watch <device> --config   # ...and print a starter keyd config
+
+`keyd monitor` covers some of this, but it watches every device on the system at
+once - including whatever you type into other windows - and it cannot help
+before a config exists.  keyd-probe scopes to one physical device and never
+opens anything else.
+
+Requires root to read /dev/input (or membership of the `input` group).
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+
+# struct input_event: struct timeval (2x long), u16 type, u16 code, s32 value
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+
+EV_KEY = 0x01
+EV_REL = 0x02
+EV_ABS = 0x03
+EV_MSC = 0x04
+MSC_SCAN = 0x04
+
+PROC_DEVICES = "/proc/bus/input/devices"
+EVENT_CODES_HEADER = "/usr/include/linux/input-event-codes.h"
+
+# evdev names whose keyd spelling is not just the lowercased suffix.
+KEYD_ALIASES = {
+    "KEY_LEFTCTRL": "leftcontrol",
+    "KEY_RIGHTCTRL": "rightcontrol",
+    "KEY_LEFTALT": "leftalt",
+    "KEY_RIGHTALT": "rightalt",
+    "KEY_LEFTSHIFT": "leftshift",
+    "KEY_RIGHTSHIFT": "rightshift",
+    "KEY_LEFTMETA": "leftmeta",
+    "KEY_RIGHTMETA": "rightmeta",
+    "KEY_ESC": "esc",
+    "KEY_ENTER": "enter",
+    "KEY_KPENTER": "kpenter",
+    "KEY_MINUS": "minus",
+    "KEY_EQUAL": "equal",
+    "KEY_GRAVE": "grave",
+    "KEY_APOSTROPHE": "apostrophe",
+    "KEY_SEMICOLON": "semicolon",
+    "KEY_BACKSLASH": "backslash",
+    "KEY_LEFTBRACE": "leftbrace",
+    "KEY_RIGHTBRACE": "rightbrace",
+}
+
+
+def supports_colour() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class Style:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def bold(self, t: str) -> str:
+        return self._wrap("1", t)
+
+    def dim(self, t: str) -> str:
+        return self._wrap("2", t)
+
+    def green(self, t: str) -> str:
+        return self._wrap("32", t)
+
+    def yellow(self, t: str) -> str:
+        return self._wrap("33", t)
+
+    def cyan(self, t: str) -> str:
+        return self._wrap("36", t)
+
+
+S = Style(supports_colour())
+
+
+# --------------------------------------------------------------------------
+# Key-name tables
+# --------------------------------------------------------------------------
+
+def load_evdev_names() -> dict[int, str]:
+    """Map evdev code -> KEY_*/BTN_* name, parsed from the kernel headers.
+
+    Returns an empty map if the headers are not installed; callers fall back to
+    printing bare numeric codes rather than inventing names.
+    """
+    names: dict[int, str] = {}
+    try:
+        with open(EVENT_CODES_HEADER) as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 3 or parts[0] != "#define":
+                    continue
+                name = parts[1]
+                if not (name.startswith("KEY_") or name.startswith("BTN_")):
+                    continue
+                raw = parts[2]
+                try:
+                    code = int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+                except ValueError:
+                    continue
+                names.setdefault(code, name)
+    except OSError:
+        pass
+    return names
+
+
+def load_keyd_keys() -> set[str]:
+    """The set of key names keyd accepts, straight from `keyd list-keys`."""
+    if shutil.which("keyd") is None:
+        return set()
+    try:
+        out = subprocess.run(
+            ["keyd", "list-keys"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+
+
+def to_keyd_name(evdev_name: str, keyd_keys: set[str]) -> str | None:
+    """Translate an evdev name to keyd's spelling, verified against keyd itself.
+
+    Returns None when keyd has no name for it, which is worth surfacing: it
+    means the key cannot be used as a bind source without patching keyd.
+    """
+    candidates = []
+    if evdev_name in KEYD_ALIASES:
+        candidates.append(KEYD_ALIASES[evdev_name])
+    stripped = re.sub(r"^(KEY_|BTN_)", "", evdev_name).lower()
+    candidates.append(stripped)
+
+    if not keyd_keys:
+        # keyd is not installed; offer the best guess but say it is unverified.
+        return candidates[0]
+    for candidate in candidates:
+        if candidate in keyd_keys:
+            return candidate
+    return None
+
+
+# --------------------------------------------------------------------------
+# Device discovery
+# --------------------------------------------------------------------------
+
+class Interface:
+    """One kernel input interface (one event node) of a physical device."""
+
+    def __init__(self, name: str, vendor: str, product: str) -> None:
+        self.name = name
+        self.vendor = vendor
+        self.product = product
+        self.phys = ""
+        self.handlers: list[str] = []
+        self.key_bitmap = ""
+
+    @property
+    def usb_id(self) -> str:
+        return f"{self.vendor}:{self.product}"
+
+    @property
+    def event_node(self) -> str | None:
+        for handler in self.handlers:
+            if handler.startswith("event"):
+                return f"/dev/input/{handler}"
+        return None
+
+    @property
+    def kind(self) -> str:
+        has_keys = "kbd" in self.handlers
+        has_pointer = any(h.startswith("mouse") for h in self.handlers)
+        if has_keys and has_pointer:
+            return "keyboard+pointer"
+        if has_keys:
+            return "keyboard"
+        if has_pointer:
+            return "pointer"
+        return "other"
+
+
+def parse_devices() -> list[Interface]:
+    """Parse /proc/bus/input/devices into a flat list of interfaces."""
+    try:
+        with open(PROC_DEVICES) as handle:
+            blob = handle.read()
+    except OSError as exc:
+        die(f"cannot read {PROC_DEVICES}: {exc}")
+
+    interfaces: list[Interface] = []
+    for block in blob.split("\n\n"):
+        if not block.strip():
+            continue
+        ids = re.search(r"Vendor=(\w+) Product=(\w+)", block)
+        name = re.search(r'N: Name="(.*)"', block)
+        if not ids or not name:
+            continue
+        iface = Interface(name.group(1), ids.group(1), ids.group(2))
+        phys = re.search(r"P: Phys=(.*)", block)
+        if phys:
+            iface.phys = phys.group(1).strip()
+        handlers = re.search(r"H: Handlers=(.*)", block)
+        if handlers:
+            iface.handlers = handlers.group(1).split()
+        keys = re.search(r"B: KEY=([0-9a-f ]+)", block)
+        if keys:
+            iface.key_bitmap = keys.group(1).strip()
+        interfaces.append(iface)
+    return interfaces
+
+
+def group_by_device(interfaces: list[Interface]) -> dict[str, list[Interface]]:
+    """Group interfaces by USB id - this is the unit keyd's [ids] section matches."""
+    grouped: dict[str, list[Interface]] = defaultdict(list)
+    for iface in interfaces:
+        grouped[iface.usb_id].append(iface)
+    return grouped
+
+
+def keyd_matched_ids() -> set[str]:
+    """USB ids keyd currently manages, read from its own journal output."""
+    if shutil.which("journalctl") is None:
+        return set()
+    try:
+        out = subprocess.run(
+            ["journalctl", "-u", "keyd", "--no-pager", "-n", "200"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return set(re.findall(r"DEVICE: match\s+(\w{4}:\w{4}):", out.stdout))
+
+
+def resolve_target(target: str, grouped: dict[str, list[Interface]]) -> tuple[str, list[Interface]]:
+    """Resolve a user-supplied device selector to one USB id and its interfaces.
+
+    Accepts a USB id (0816:246e), an event node (event30 or /dev/input/event30),
+    or a case-insensitive substring of the device name.
+    """
+    if target in grouped:
+        return target, grouped[target]
+
+    node = os.path.basename(target)
+    if node.startswith("event"):
+        for usb_id, ifaces in grouped.items():
+            if any(node in iface.handlers for iface in ifaces):
+                return usb_id, ifaces
+        die(f"no device owns {node}")
+
+    needle = target.lower()
+    hits = {
+        usb_id: ifaces
+        for usb_id, ifaces in grouped.items()
+        if any(needle in iface.name.lower() for iface in ifaces)
+    }
+    if not hits:
+        die(f"no device matches {target!r} - try `keyd-probe list`")
+    if len(hits) > 1:
+        names = ", ".join(f"{k} ({v[0].name})" for k, v in hits.items())
+        die(f"{target!r} is ambiguous: {names}")
+    usb_id, ifaces = next(iter(hits.items()))
+    return usb_id, ifaces
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_list(args: argparse.Namespace) -> int:
+    interfaces = parse_devices()
+    grouped = group_by_device(interfaces)
+    managed = keyd_matched_ids()
+
+    print(S.bold("Input devices, grouped by USB id (what keyd's [ids] matches):"))
+    print()
+
+    for usb_id, ifaces in sorted(grouped.items(), key=lambda kv: kv[1][0].name.lower()):
+        if not args.all and usb_id.startswith("0000"):
+            continue  # virtual/internal: power buttons, video bus, PC speaker
+
+        label = shared_name(ifaces)
+        tag = ""
+        if usb_id in managed:
+            tag = S.green("  [managed by keyd]")
+        print(f"  {S.cyan(usb_id)}  {S.bold(label)}{tag}")
+
+        for iface in sorted(ifaces, key=lambda i: i.name):
+            node = iface.event_node or "-"
+            suffix = iface.name[len(label):].strip() or "(base)"
+            print(f"      {node:<20} {iface.kind:<16} {S.dim(suffix)}")
+
+        if len(ifaces) > 1:
+            print(S.dim(f"      {len(ifaces)} interfaces - controls may be split across them"))
+        print()
+
+    if not args.all:
+        print(S.dim("  (virtual devices hidden; pass --all to show them)"))
+    return 0
+
+
+def shared_name(ifaces: list[Interface]) -> str:
+    """Longest common prefix of the interface names, which is the device's real name."""
+    names = [i.name for i in ifaces]
+    if len(names) == 1:
+        return names[0]
+    prefix = os.path.commonprefix(names).rstrip()
+    return prefix or names[0]
+
+
+class Observation:
+    """Everything learned about one physical control during a watch."""
+
+    def __init__(self, code: int, evdev_name: str, node: str) -> None:
+        self.code = code
+        self.evdev_name = evdev_name
+        self.nodes = {node}
+        self.presses = 0
+        self.repeats = 0
+        self.scancode: int | None = None
+        self.overlapped_with: set[str] = set()
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    interfaces = parse_devices()
+    grouped = group_by_device(interfaces)
+    usb_id, ifaces = resolve_target(args.device, grouped)
+
+    managed = keyd_matched_ids()
+    is_managed = usb_id in managed
+
+    if args.output:
+        nodes = keyd_virtual_nodes()
+        if not nodes:
+            die("no keyd virtual devices found - is keyd running?")
+    else:
+        nodes = [i.event_node for i in ifaces if i.event_node]
+        if not nodes:
+            die(f"{usb_id} exposes no event nodes")
+
+        if is_managed:
+            # keyd calls EVIOCGRAB (device.c), taking exclusive ownership. Reading
+            # these nodes now yields nothing at all, which looks exactly like broken
+            # hardware, so refuse rather than hand back a silently empty capture.
+            die(
+                f"keyd has grabbed this device, so its raw nodes emit nothing.\n\n"
+                f"  keyd takes an exclusive grab (EVIOCGRAB) on every device it manages.\n"
+                f"  Two ways forward:\n\n"
+                f"    See the RAW hardware (what the device really sends):\n"
+                f"      systemctl stop keyd && {abs_invocation()} ; systemctl start keyd\n\n"
+                f"    See keyd's OUTPUT (what your config turns it into):\n"
+                f"      {abs_invocation(extra='--output')}\n"
+            )
+
+    evdev_names = load_evdev_names()
+    keyd_keys = load_keyd_keys()
+
+    fds: dict[int, str] = {}
+    for node in nodes:
+        try:
+            fds[os.open(node, os.O_RDONLY)] = node
+        except PermissionError:
+            # Absolute path on purpose: pkexec resets the working directory to
+            # root's home, so a relative ./keyd-probe would not be found.
+            die(
+                f"permission denied on {node}\n\n"
+                f"  Reading input devices needs root. Try:\n"
+                f"    pkexec {abs_invocation()}\n\n"
+                f"  (or add yourself to the `input` group and log back in)"
+            )
+        except OSError as exc:
+            warn(f"cannot open {node}: {exc}")
+
+    if not fds:
+        die("no readable event nodes")
+
+    what = "keyd's output" if args.output else f"{shared_name(ifaces)}  ({S.cyan(usb_id)})"
+    print(S.bold(f"Watching {what}"))
+    print(S.dim(f"  {len(fds)} node(s): {', '.join(os.path.basename(n) for n in fds.values())}"))
+    if args.output:
+        print(S.dim(
+            "  These are keyd's virtual devices: events AFTER your config is applied.\n"
+            "  They carry only devices keyd manages, so nothing else on the system leaks in."
+        ))
+    print()
+    print(S.bold("  Press each control in turn. Ctrl-C when done.") if args.seconds <= 0
+          else S.bold(f"  Press each control in turn. Stops after {args.seconds}s or Ctrl-C."))
+    print(S.dim("  For a rotary encoder, also try pushing it in *while* turning it."))
+    print()
+
+    seen: dict[int, Observation] = {}
+    order: list[int] = []
+    held: set[int] = set()
+    pending_scan: dict[str, int] = {}
+
+    deadline = time.time() + args.seconds if args.seconds > 0 else None
+    try:
+        while deadline is None or time.time() < deadline:
+            ready, _, _ = select.select(list(fds), [], [], 0.5)
+            for fd in ready:
+                data = os.read(fd, EVENT_SIZE * 64)
+                node = fds[fd]
+                for offset in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                    _, _, etype, code, value = struct.unpack(
+                        EVENT_FORMAT, data[offset:offset + EVENT_SIZE]
+                    )
+                    if etype == EV_MSC and code == MSC_SCAN:
+                        pending_scan[node] = value
+                        continue
+                    if etype != EV_KEY:
+                        continue
+
+                    name = evdev_names.get(code, f"code {code}")
+                    obs = seen.get(code)
+                    if obs is None:
+                        obs = Observation(code, name, os.path.basename(node))
+                        seen[code] = obs
+                        order.append(code)
+                    obs.nodes.add(os.path.basename(node))
+                    scan = pending_scan.pop(node, None)
+                    if scan is not None:
+                        obs.scancode = scan
+
+                    if value == 1:
+                        obs.presses += 1
+                        for other in held:
+                            obs.overlapped_with.add(evdev_names.get(other, str(other)))
+                            seen[other].overlapped_with.add(name)
+                        held.add(code)
+                        keyd_name = to_keyd_name(name, keyd_keys)
+                        shown = keyd_name or S.yellow("(no keyd name)")
+                        extra = f"  scancode=0x{scan:x}" if scan is not None else ""
+                        print(f"  {S.green('down')}  {name:<22} keyd: {S.cyan(str(shown)):<16}"
+                              f"{S.dim(os.path.basename(node))}{S.dim(extra)}")
+                    elif value == 0:
+                        held.discard(code)
+                    elif value == 2:
+                        obs.repeats += 1
+    except KeyboardInterrupt:
+        print()
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+    if not seen:
+        warn("no key events captured - nothing was pressed, or the device sends "
+             "only relative/absolute axes (which keyd cannot bind).")
+        return 1
+
+    print()
+    report(usb_id, ifaces, seen, order, keyd_keys, args.config)
+    return 0
+
+
+def report(usb_id, ifaces, seen, order, keyd_keys, emit_config: bool) -> None:
+    print(S.bold("Controls discovered"))
+    print()
+    header = f"  {'evdev':<22} {'keyd name':<16} {'interface':<12} {'presses':>7}  notes"
+    print(header)
+    print(S.dim("  " + "-" * (len(header) - 2)))
+
+    unnameable = []
+    for code in order:
+        obs = seen[code]
+        keyd_name = to_keyd_name(obs.evdev_name, keyd_keys)
+        if keyd_name is None:
+            unnameable.append(obs.evdev_name)
+        notes = []
+        if obs.repeats:
+            notes.append("auto-repeats when held")
+        if obs.overlapped_with:
+            notes.append("held with " + ", ".join(sorted(obs.overlapped_with)))
+        print(f"  {obs.evdev_name:<22} {str(keyd_name or '-'):<16} "
+              f"{','.join(sorted(obs.nodes)):<12} {obs.presses:>7}  {S.dim('; '.join(notes))}")
+
+    print()
+    interpret(seen, order)
+
+    if unnameable:
+        print()
+        warn("keyd has no name for: " + ", ".join(unnameable) +
+             "\n  These cannot be used as bind sources without patching keyd.")
+
+    if emit_config:
+        print()
+        print(S.bold("Starter config") + S.dim("  -> /etc/keyd/<name>.conf"))
+        print()
+        print(generate_config(usb_id, ifaces, seen, order, keyd_keys))
+
+
+def interpret(seen, order) -> None:
+    """Call out the patterns that actually trip people up."""
+    findings = []
+
+    nodes_used = {n for code in order for n in seen[code].nodes}
+    if len(nodes_used) > 1:
+        findings.append(
+            f"Controls are split across {len(nodes_used)} interfaces ({', '.join(sorted(nodes_used))}). "
+            "One [ids] section covers them all, since keyd matches by USB id."
+        )
+
+    names = [seen[c].evdev_name for c in order]
+    numpad = [n for n in names if n.startswith("KEY_KP")]
+    if numpad:
+        findings.append(
+            f"{len(numpad)} control(s) report as numpad keys ({', '.join(numpad)}). "
+            "These are indistinguishable from a real numpad, so scope your config "
+            "by USB id or you will remap the numpad on your main keyboard too."
+        )
+
+    consumer = [n for n in names if n in {"KEY_VOLUMEUP", "KEY_VOLUMEDOWN", "KEY_MUTE",
+                                          "KEY_PLAYPAUSE", "KEY_NEXTSONG", "KEY_PREVIOUSSONG"}]
+    if consumer:
+        findings.append(
+            f"Media/consumer controls present ({', '.join(consumer)}). A knob usually "
+            "reports as volume up/down, one event per detent."
+        )
+
+    # The encoder question: can any control be held while another fires?
+    overlapping = [seen[c].evdev_name for c in order if seen[c].overlapped_with]
+    if overlapping:
+        findings.append(
+            "Simultaneous presses observed (" + ", ".join(sorted(set(overlapping))) +
+            "), so these can drive a held-modifier layer."
+        )
+    elif len(order) > 1:
+        findings.append(
+            "No two controls were ever held at once. If you tried pushing a knob "
+            "while turning it and it does not appear here, the encoder cannot report "
+            "both - use a latched layer (toggle) rather than a held modifier."
+        )
+
+    if findings:
+        print(S.bold("What this means"))
+        for item in findings:
+            print(f"  - {item}")
+
+
+def generate_config(usb_id, ifaces, seen, order, keyd_keys) -> str:
+    name = shared_name(ifaces)
+    lines = [
+        f"# {name}",
+        f"# Generated by keyd-probe on {time.strftime('%Y-%m-%d')}.",
+        "#",
+        "# Replace each right-hand side with what you want the control to do.",
+        "# Validate with `keyd check`, then apply with `systemctl restart keyd`.",
+        "",
+        "[ids]",
+        usb_id,
+        "",
+        "[main]",
+        "",
+    ]
+    for code in order:
+        obs = seen[code]
+        keyd_name = to_keyd_name(obs.evdev_name, keyd_keys)
+        if keyd_name is None:
+            lines.append(f"# {obs.evdev_name}: no keyd name, cannot be bound")
+            lines.append("")
+            continue
+        # keyd only ignores lines that BEGIN with a hash - there is no trailing
+        # comment syntax, so an inline comment is parsed as part of the action.
+        note = f"# {obs.evdev_name} on {','.join(sorted(obs.nodes))}"
+        if obs.repeats:
+            note += ", auto-repeats when held"
+        lines.append(note)
+        lines.append(f"{keyd_name} = {keyd_name}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# --------------------------------------------------------------------------
+# Plumbing
+# --------------------------------------------------------------------------
+
+def abs_invocation(extra: str = "") -> str:
+    """This command line, with an absolute script path.
+
+    pkexec and sudo -i reset the working directory, so a relative path in a
+    suggested command silently fails to resolve.
+    """
+    import shlex
+    script = os.path.abspath(sys.argv[0])
+    parts = [script] + sys.argv[1:]
+    if extra:
+        parts.append(extra)
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def keyd_virtual_nodes() -> list[str]:
+    """Event nodes for keyd's virtual devices - its post-remap output."""
+    nodes = []
+    for iface in parse_devices():
+        if iface.name.startswith("keyd virtual") and iface.event_node:
+            nodes.append(iface.event_node)
+    return nodes
+
+
+def warn(message: str) -> None:
+    print(f"{S.yellow('warning:')} {message}", file=sys.stderr)
+
+
+def die(message: str) -> "NoReturn":  # type: ignore[valid-type]
+    print(f"{S.yellow('error:')} {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="keyd-probe",
+        description="Find out what an input device actually sends, then scaffold a keyd config.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="list input devices, grouped by USB id")
+    p_list.add_argument("--all", action="store_true",
+                        help="include virtual/internal devices (power button, video bus, ...)")
+    p_list.set_defaults(func=cmd_list)
+
+    p_watch = sub.add_parser("watch", help="watch one device and report what each control sends")
+    p_watch.add_argument("device", help="USB id (0816:246e), event node (event30), or name substring")
+    p_watch.add_argument("--seconds", type=int, default=0,
+                         help="stop after N seconds (default: run until Ctrl-C)")
+    p_watch.add_argument("--config", action="store_true",
+                         help="also print a starter keyd config for what was discovered")
+    p_watch.add_argument("--output", action="store_true",
+                         help="watch keyd's virtual devices instead, to see what your "
+                              "config produces rather than what the hardware sends")
+    p_watch.set_defaults(func=cmd_watch)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        os._exit(0)
