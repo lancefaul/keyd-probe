@@ -103,8 +103,11 @@ def run():
     out = buf.getvalue()
     check("2 interfaces" in out, "reports controls split across interfaces")
     check("numpad" in out and "main keyboard" in out, "warns numpad keys collide with a real numpad")
-    check("latched layer (toggle)" in out, "recommends a latch when nothing overlapped")
     check("auto-repeats" in out, "notes the key that auto-repeats")
+    check("push-and-turn is impossible" in out,
+          "states plainly that push-and-turn cannot work on this encoder")
+    check("toggle(fast)" in out, "recommends a latched layer with concrete syntax")
+    check("overload(fast" not in out, "does not also suggest a held modifier on the knob")
     print()
 
     print("quirk detection - encoder that CAN report press+turn")
@@ -113,8 +116,23 @@ def run():
     with redirect_stdout(buf):
         kp.report("0816:246e", ifaces, seen, order, keyd_keys, emit_config=False)
     out = buf.getvalue()
-    check("held-modifier layer" in out, "recommends a held modifier when presses overlapped")
-    check("latched layer (toggle)" not in out, "does not also recommend a latch")
+    check("push-and-turn" in out and "works" in out,
+          "confirms push-and-turn when the button overlapped rotation")
+    check("overload(fast" in out, "recommends a held modifier with concrete syntax")
+    check("push-and-turn is impossible" not in out, "does not also claim it is impossible")
+    print()
+
+    print("quirk detection - a device with no knob at all")
+    seen, order = fixture_macropad(with_overlap=False)
+    for code in (115, 114, 113):
+        del seen[code]
+    order = [c for c in order if c in seen]
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        kp.report("0816:246e", ifaces, seen, order, keyd_keys, emit_config=False)
+    out = buf.getvalue()
+    check("push-and-turn" not in out and "knob" not in out,
+          "says nothing about encoders when the device has none")
     print()
 
     print("generated config")

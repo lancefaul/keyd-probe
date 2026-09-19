@@ -243,15 +243,44 @@ def group_by_device(interfaces: list[Interface]) -> dict[str, list[Interface]]:
     return grouped
 
 
-def keyd_matched_ids() -> set[str]:
-    """USB ids keyd currently manages, read from its own journal output."""
-    if shutil.which("journalctl") is None:
-        return set()
+def systemctl(*args: str) -> str:
+    """Run systemctl and return stdout, or "" if it cannot be run."""
+    if shutil.which("systemctl") is None:
+        return ""
     try:
         out = subprocess.run(
-            ["journalctl", "-u", "keyd", "--no-pager", "-n", "200"],
+            ["systemctl", *args],
             capture_output=True, text=True, timeout=10, check=False,
         )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
+
+
+def keyd_running() -> bool:
+    return systemctl("is-active", "keyd") == "active"
+
+
+def keyd_matched_ids() -> set[str]:
+    """USB ids keyd currently manages.
+
+    Only meaningful while keyd is running: a stopped keyd holds no grabs, but
+    its `DEVICE: match` lines linger in the journal. Reading those stale lines
+    made the tool refuse to watch a device that was in fact free - so bail out
+    early if the daemon is not active, and otherwise only trust lines logged by
+    the process that is running right now.
+    """
+    if not keyd_running():
+        return set()
+    if shutil.which("journalctl") is None:
+        return set()
+
+    since = systemctl("show", "keyd", "-p", "ActiveEnterTimestamp", "--value")
+    cmd = ["journalctl", "-u", "keyd", "--no-pager", "-n", "500"]
+    if since:
+        cmd += ["--since", since]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return set()
     return set(re.findall(r"DEVICE: match\s+(\w{4}:\w{4}):", out.stdout))
@@ -541,24 +570,77 @@ def interpret(seen, order) -> None:
             "reports as volume up/down, one event per detent."
         )
 
-    # The encoder question: can any control be held while another fires?
-    overlapping = [seen[c].evdev_name for c in order if seen[c].overlapped_with]
+    findings.extend(encoder_findings(seen, order))
+
+    overlapping = sorted({seen[c].evdev_name for c in order if seen[c].overlapped_with})
     if overlapping:
         findings.append(
-            "Simultaneous presses observed (" + ", ".join(sorted(set(overlapping))) +
-            "), so these can drive a held-modifier layer."
+            "Held simultaneously: " + ", ".join(overlapping) +
+            ". Any of these can host a held-modifier layer, e.g. overload()."
         )
     elif len(order) > 1:
         findings.append(
-            "No two controls were ever held at once. If you tried pushing a knob "
-            "while turning it and it does not appear here, the encoder cannot report "
-            "both - use a latched layer (toggle) rather than a held modifier."
+            "No two controls were ever held at once. Either they were pressed one "
+            "at a time, or this device cannot report simultaneous presses - which "
+            "would rule out held-modifier layers entirely."
         )
 
     if findings:
         print(S.bold("What this means"))
         for item in findings:
             print(f"  - {item}")
+
+
+ROTATION_KEYS = {"KEY_VOLUMEUP", "KEY_VOLUMEDOWN"}
+
+
+def encoder_findings(seen, order) -> list[str]:
+    """Answer the question that decides a rotary encoder's whole config.
+
+    A knob that can report its button held *while* the shaft turns supports
+    "push and turn" - a held modifier. Many encoders physically cannot: the
+    button reports up the instant rotation starts. That difference forces a
+    completely different design (a latched toggle instead of a held layer), and
+    it is invisible until someone actually tries it, so it is worth calling out
+    explicitly rather than leaving it to a generic overlap check.
+    """
+    rotation = [c for c in order if seen[c].evdev_name in ROTATION_KEYS]
+    if not rotation:
+        return []
+
+    rotation_nodes = set()
+    for code in rotation:
+        rotation_nodes |= seen[code].nodes
+
+    # The knob's button is whatever else lives on the same interface as the
+    # rotation events - typically KEY_MUTE on a consumer-control interface.
+    buttons = [
+        c for c in order
+        if c not in rotation and (seen[c].nodes & rotation_nodes)
+    ]
+    if not buttons:
+        return ["A rotary knob was detected, but no button on the same interface - "
+                "this knob probably does not click."]
+
+    rotation_names = {seen[c].evdev_name for c in rotation}
+    findings = []
+    for code in buttons:
+        obs = seen[code]
+        if obs.overlapped_with & rotation_names:
+            findings.append(
+                f"{obs.evdev_name} was held WHILE the knob turned, so push-and-turn "
+                f"works: you can put a held modifier on the knob press, e.g. "
+                f"`{obs.evdev_name.replace('KEY_', '').lower()} = overload(fast, enter)`."
+            )
+        else:
+            findings.append(
+                f"{obs.evdev_name} (the knob press) never overlapped with rotation. "
+                f"If you tried pushing it in while turning, this encoder cannot report "
+                f"both at once - push-and-turn is impossible in ANY config. Use a "
+                f"latched layer instead: `{obs.evdev_name.replace('KEY_', '').lower()} "
+                f"= toggle(fast)`, tapped to switch modes."
+            )
+    return findings
 
 
 def generate_config(usb_id, ifaces, seen, order, keyd_keys) -> str:
@@ -654,6 +736,15 @@ def main() -> int:
     p_watch.set_defaults(func=cmd_watch)
 
     args = parser.parse_args()
+
+    # `watch` prints events as they happen, but stdout is block-buffered when it
+    # is not a terminal - so piping to a file or tee would show nothing until
+    # exit. Line buffering keeps a redirected live capture readable.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+
     return args.func(args)
 
 

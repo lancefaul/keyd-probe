@@ -34,28 +34,41 @@ Input devices, grouped by USB id (what keyd's [ids] matches):
 ```console
 $ sudo keyd-probe watch 0816:246e --config
 Watching SDINNOVATION SIDE-KEYBOARD  (0816:246e)
+  4 node(s): event30, event31, event256, event257
 
   down  KEY_KP1                keyd: kp1             event257  scancode=0x70059
   down  KEY_VOLUMEUP           keyd: volumeup        event30   scancode=0xc00e9
+  down  KEY_MUTE               keyd: mute            event30   scancode=0xc00e2
   ...
 
 Controls discovered
 
-  evdev                  keyd name        interface      presses  notes
-  KEY_KP1                kp1              event257             2
-  KEY_VOLUMEUP           volumeup         event30             12
-  ...
+  evdev                  keyd name        interface    presses  notes
+  -------------------------------------------------------------------
+  KEY_KP1                kp1              event257           3  auto-repeats when held; held with KEY_KP2
+  KEY_KP2                kp2              event257           3  held with KEY_KP1, KEY_KP3
+  KEY_VOLUMEUP           volumeup         event30           11
+  KEY_MUTE               mute             event30            3  auto-repeats when held
 
 What this means
-  - Controls are split across 2 interfaces (event30, event257). One [ids]
+  - Controls are split across 2 interfaces (event257, event30). One [ids]
     section covers them all, since keyd matches by USB id.
-  - 4 control(s) report as numpad keys. These are indistinguishable from a real
-    numpad, so scope your config by USB id or you will remap the numpad on your
-    main keyboard too.
-  - No two controls were ever held at once. If you tried pushing a knob while
-    turning it and it does not appear here, the encoder cannot report both —
-    use a latched layer (toggle) rather than a held modifier.
+  - 4 control(s) report as numpad keys (KEY_KP1, KEY_KP2, KEY_KP3, KEY_KP4).
+    These are indistinguishable from a real numpad, so scope your config by USB
+    id or you will remap the numpad on your main keyboard too.
+  - KEY_MUTE (the knob press) never overlapped with rotation. If you tried
+    pushing it in while turning, this encoder cannot report both at once —
+    push-and-turn is impossible in ANY config. Use a latched layer instead:
+    `mute = toggle(fast)`, tapped to switch modes.
+  - Held simultaneously: KEY_KP1, KEY_KP2, KEY_KP3. Any of these can host a
+    held-modifier layer, e.g. overload().
 ```
+
+That last pair of findings is the point of the tool. Whether a knob can report
+its button held *while* the shaft turns decides the entire shape of your config
+— a held modifier versus a latched toggle — and nothing tells you except trying
+it. That output is a real capture from a device where it turned out to be
+impossible.
 
 A device can be named three ways: USB id (`0816:246e`), event node (`event30`),
 or a substring of its name (`side-keyboard`).
