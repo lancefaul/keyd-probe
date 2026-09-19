@@ -1,0 +1,114 @@
+.TH KEYD\-PROBE 1 "2026-09-19" "keyd-probe 0.1.0" "User Commands"
+.SH NAME
+keyd\-probe \- identify what an input device sends, and scaffold a keyd config
+.SH SYNOPSIS
+.B keyd\-probe
+.I list
+.RB [ \-\-all ]
+.br
+.B keyd\-probe
+.I watch
+.I DEVICE
+.RB [ \-\-seconds
+.IR N ]
+.RB [ \-\-config ]
+.RB [ \-\-output ]
+.SH DESCRIPTION
+.B keyd (1)
+remaps keys by name, so the first problem is not what a key should do but what
+it actually sends. Devices routinely misreport: a four\-key macropad ships as
+numpad 1\-4, a volume knob ships as consumer\-control volume keys, and one
+physical device can expose several kernel interfaces with its controls split
+across them.
+.PP
+.B keyd\-probe
+watches a single device, reports what each control emits in both evdev and keyd
+spelling, and can print a starter configuration.
+.SH COMMANDS
+.TP
+.B list
+List input devices grouped by USB id, which is the unit keyd's
+.B [ids]
+section matches. Multi\-interface devices are flagged, as are devices keyd
+currently manages. Virtual devices are hidden unless
+.B \-\-all
+is given.
+.TP
+.BI watch " DEVICE"
+Watch one device and report every control pressed. The device may be named by
+USB id
+.RI ( 0816:246e ),
+by event node
+.RI ( event30 " or " /dev/input/event30 ),
+or by a case\-insensitive substring of its name.
+.SH OPTIONS
+.TP
+.BI \-\-seconds " N"
+Stop after N seconds. The default is to run until interrupted.
+.TP
+.B \-\-config
+After the summary, print a starter
+.B [ids]
+and
+.B [main]
+stanza covering every control that was discovered.
+.TP
+.B \-\-output
+Watch keyd's virtual devices rather than the hardware, showing the events your
+configuration produces instead of the ones the device sends.
+.TP
+.B \-\-all
+For
+.IR list ,
+include virtual and internal devices such as power buttons and the video bus.
+.SH ANALYSIS
+After a capture,
+.B keyd\-probe
+reports what the results mean. It calls out controls split across several
+interfaces, keys that masquerade as a numpad and will therefore collide with a
+real one unless the configuration is scoped by USB id, and keys for which keyd
+has no name at all.
+.PP
+For rotary encoders it answers the question that decides the entire
+configuration: whether the knob can report its button held
+.I while
+the shaft turns. Many encoders cannot; the button reports released the instant
+rotation begins. Where it works, a held modifier such as
+.B overload()
+is possible; where it does not, only a latched
+.B toggle()
+will do. This is invisible until someone tries it.
+.SH EXCLUSIVE GRABS
+.B keyd
+takes an exclusive grab
+.RB ( EVIOCGRAB )
+on every device it manages, so reading that device's raw nodes returns nothing
+at all \- which looks exactly like broken hardware.
+.B keyd\-probe
+detects this and refuses rather than returning an empty capture. Either stop
+keyd to see the raw hardware, or pass
+.B \-\-output
+to watch keyd's own output instead.
+.SH EXIT STATUS
+.TP
+.B 0
+Controls were discovered and reported.
+.TP
+.B 1
+No events were captured, the device could not be resolved, or permission was
+denied.
+.SH FILES
+.TP
+.I /proc/bus/input/devices
+Enumerated to discover devices and their interfaces.
+.TP
+.I /dev/input/event*
+Read directly. Requires root, or membership of the
+.B input
+group.
+.SH SEE ALSO
+.BR keyd (1)
+.PP
+https://github.com/lancefaul/keyd\-probe
+.SH AUTHOR
+Lance Faul
