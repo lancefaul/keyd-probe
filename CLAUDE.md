@@ -25,6 +25,16 @@ details.
   test something.
 - Commit straight to `master`. Releases (GitHub plus the local package) follow the `release` skill.
 
+## Review
+
+Before merging or shipping: the user-level `pre-merge-review` skill — `/code-review` on the
+diff in a fresh context, `/security-review` when it touches input capture or the commands it suggests running as root, findings as Important / Nit / Pre-existing with file and line, every
+finding answered, at most three rounds.
+
+**Always needs the owner's eyes:** what `watch` captures, any command it suggests running with `pkexec`, generated keyd configs, `packaging/aur/PKGBUILD` and releases.
+
+**How to undo:** `git revert` on `master`; the installed package is replaced by reinstalling the previous `.pkg.tar.zst`.
+
 ## Skills learn
 
 A lesson lands here or in the `release` skill in the same commit: a device that behaved
