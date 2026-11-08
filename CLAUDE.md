@@ -40,3 +40,7 @@ finding answered, at most three rounds.
 A lesson lands here or in the `release` skill in the same commit: a device that behaved
 unexpectedly, a keyd change that broke a generated config, a release step that went wrong. Never
 general advice, and never anything personal.
+
+## Audits
+
+**Audits:** untangle not yet (counted from 2026-11-07); state-machine-audit not yet (counted from 2026-11-07). Update with the area and date after each run (`untangle-codebase`, `state-machine-audit`); the monthly `audit-due` check reads this line.
